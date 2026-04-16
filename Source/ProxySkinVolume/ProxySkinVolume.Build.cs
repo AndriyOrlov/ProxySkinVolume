@@ -24,6 +24,7 @@ public class ProxySkinVolume : ModuleRules
 				"EditorFramework",
 				"ToolMenus",
 				"LevelEditor",
+				"PropertyEditor",
 				"Projects",
 				"EditorSubsystem",
 				"MeshDescription",

@@ -2,13 +2,16 @@
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
+#include "Components/BillboardComponent.h"
 #include "Components/BoxComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SphereComponent.h"
+#include "DrawDebugHelpers.h"
 #include "DynamicMesh/DynamicMesh3.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
+#include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GeometryScript/MeshAssetFunctions.h"
@@ -16,6 +19,7 @@
 #include "GeometryScript/MeshPrimitiveFunctions.h"
 #include "GeometryScript/MeshSimplifyFunctions.h"
 #include "GeometryScript/MeshTransformFunctions.h"
+#include "GeometryScript/MeshVoxelFunctions.h"
 #include "IAssetTools.h"
 #include "IMeshReductionManagerModule.h"
 #include "Materials/MaterialInterface.h"
@@ -25,6 +29,8 @@
 #include "Misc/PackageName.h"
 #include "Misc/ScopeExit.h"
 #include "Modules/ModuleManager.h"
+#include "StaticMeshResources.h"
+#include "UObject/ConstructorHelpers.h"
 #include "UObject/Package.h"
 #include "UDynamicMesh.h"
 
@@ -48,7 +54,9 @@ namespace
 
 AProxySkinVolume::AProxySkinVolume()
 {
-	PrimaryActorTick.bCanEverTick = false;
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = true;
+	PrimaryActorTick.bTickEvenWhenPaused = true;
 	bIsEditorOnlyActor = true;
 	bRunConstructionScriptOnDrag = false;
 
@@ -57,9 +65,10 @@ AProxySkinVolume::AProxySkinVolume()
 
 	VolumeBox = CreateDefaultSubobject<UBoxComponent>(TEXT("VolumeBox"));
 	VolumeBox->SetupAttachment(Root);
-	VolumeBox->SetBoxExtent(FVector(1500.0f, 1500.0f, 800.0f));
+	VolumeBox->SetBoxExtent(FVector(250.0f, 250.0f, 250.0f));
 	VolumeBox->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	VolumeBox->SetGenerateOverlapEvents(false);
+	VolumeBox->bDrawOnlyIfSelected = false;
 	VolumeBox->ShapeColor = FColor(60, 220, 120, 255);
 
 	PivotSphere = CreateDefaultSubobject<USphereComponent>(TEXT("PivotSphere"));
@@ -67,9 +76,41 @@ AProxySkinVolume::AProxySkinVolume()
 	PivotSphere->SetSphereRadius(20.0f);
 	PivotSphere->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	PivotSphere->SetGenerateOverlapEvents(false);
+	PivotSphere->bDrawOnlyIfSelected = false;
 	PivotSphere->ShapeColor = FColor(255, 210, 30, 255);
 
+	VolumeBillboard = CreateDefaultSubobject<UBillboardComponent>(TEXT("VolumeBillboard"));
+	VolumeBillboard->SetupAttachment(Root);
+	VolumeBillboard->SetHiddenInGame(true);
+	VolumeBillboard->SetIsVisualizationComponent(true);
+	VolumeBillboard->bIsScreenSizeScaled = true;
+	VolumeBillboard->SetRelativeScale3D(FVector(1.0f));
+#if WITH_EDITORONLY_DATA
+	static ConstructorHelpers::FObjectFinder<UTexture2D> BillboardSprite(TEXT("/Engine/EditorResources/S_VectorFieldVol.S_VectorFieldVol"));
+	if (BillboardSprite.Succeeded())
+	{
+		VolumeBillboard->SetSprite(BillboardSprite.Object);
+	}
+#endif
+
 	OutputFolder.Path = TEXT("/Game/Generated");
+}
+
+void AProxySkinVolume::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+
+#if WITH_EDITOR
+	if (ShouldDrawEditorPreview())
+	{
+		DrawEditorPreview();
+	}
+#endif
+}
+
+bool AProxySkinVolume::ShouldTickIfViewportsOnly() const
+{
+	return true;
 }
 
 void AProxySkinVolume::BakeProxySkin()
@@ -87,11 +128,25 @@ void AProxySkinVolume::BakeProxySkin()
 	const FVector WorkspaceOrigin = VolumeBox->GetComponentLocation();
 
 	UE_LOG(LogProxySkinVolume, Log, TEXT("Bake started for '%s'"), *GetActorNameOrLabel());
-	UE_LOG(LogProxySkinVolume, Log, TEXT("ProxySkinVolume pipeline revision: PSV_R4_MERGE_ONLY"));
+	UE_LOG(LogProxySkinVolume, Log, TEXT("ProxySkinVolume pipeline revision: PSV_R8_VOXEL_DECIMATE"));
 	if (bVerboseLogging)
 	{
 		UE_LOG(LogProxySkinVolume, Log, TEXT("Bake settings: MinMeshSize=%.2f, ProxyScreenSize=%.2f, MergeDistance=%.2f, HardAngle=%.2f"),
 			MinMeshSizeCm, ProxyScreenSize, MergeDistance, HardAngle);
+		UE_LOG(LogProxySkinVolume, Log, TEXT("Collection guards: MaxBoundsToVolumeRatio=%.2f"), MaxBoundsToVolumeRatio);
+		UE_LOG(LogProxySkinVolume, Log, TEXT("Voxel stage: Enabled=%s Grid=%d TargetTris=%d UseVolumeBounds=%s Padding=%.2f"),
+			bUseVoxelRemeshDecimate ? TEXT("true") : TEXT("false"),
+			VoxelGridResolution,
+			VoxelDecimateTargetTriangles,
+			bVoxelUseVolumeBounds ? TEXT("true") : TEXT("false"),
+			VoxelBoundsPaddingCm);
+		UE_LOG(LogProxySkinVolume, Log,
+			TEXT("Source type filters: StaticMeshActors=%s, BPStaticMeshComponents=%s, ISM=%s, HISM=%s, Foliage=%s"),
+			bIncludeStaticMeshActors ? TEXT("true") : TEXT("false"),
+			bIncludeBlueprintStaticMeshComponents ? TEXT("true") : TEXT("false"),
+			bIncludeInstancedStaticMeshes ? TEXT("true") : TEXT("false"),
+			bIncludeHierarchicalInstancedStaticMeshes ? TEXT("true") : TEXT("false"),
+			bIncludeFoliageInstancedStaticMeshes ? TEXT("true") : TEXT("false"));
 	}
 
 	// Always clear stale transient actors from previous bakes before starting a new run.
@@ -112,10 +167,11 @@ void AProxySkinVolume::BakeProxySkin()
 	}
 
 	UE_LOG(LogProxySkinVolume, Log,
-		TEXT("Source collection: ActorsScanned=%d, Candidates=%d, Included=%d, FilteredByBounds=%d, FilteredBySize=%d, Invalid=%d, TempActors=%d"),
+		TEXT("Source collection: ActorsScanned=%d, Candidates=%d, Included=%d, FilteredByType=%d, FilteredByBounds=%d, FilteredBySize=%d, Invalid=%d, TempActors=%d"),
 		CollectionStats.NumActorsScanned,
 		CollectionStats.NumCandidateComponents,
 		CollectionStats.NumIncludedSources,
+		CollectionStats.NumFilteredByType,
 		CollectionStats.NumFilteredByBounds,
 		CollectionStats.NumFilteredBySize,
 		CollectionStats.NumInvalidComponents,
@@ -201,6 +257,12 @@ void AProxySkinVolume::BakeProxySkin()
 		UE_LOG(LogProxySkinVolume, Log, TEXT("Trim step skipped because bTrimToVolume=false."));
 	}
 
+	if (!ApplyOptionalVoxelRemeshDecimate(WorkingMesh, WorkspaceOrigin))
+	{
+		UE_LOG(LogProxySkinVolume, Error, TEXT("Bake failed: voxel remesh/decimate stage failed."));
+		return;
+	}
+
 	if (!ApplyPivotSphereToDynamicMesh(WorkingMesh, WorkspaceOrigin))
 	{
 		UE_LOG(LogProxySkinVolume, Error, TEXT("Bake failed: could not apply PivotSphere pivot offset."));
@@ -264,6 +326,16 @@ bool AProxySkinVolume::ValidateBakeContext(FString& OutError) const
 		return false;
 	}
 
+	if (!bIncludeStaticMeshActors
+		&& !bIncludeBlueprintStaticMeshComponents
+		&& !bIncludeInstancedStaticMeshes
+		&& !bIncludeHierarchicalInstancedStaticMeshes
+		&& !bIncludeFoliageInstancedStaticMeshes)
+	{
+		OutError = TEXT("All source mesh type filters are disabled.");
+		return false;
+	}
+
 	const FBox VolumeBounds = GetVolumeWorldAABB();
 	if (!VolumeBounds.IsValid)
 	{
@@ -291,6 +363,31 @@ bool AProxySkinVolume::CollectAndExpandSourceActors(const FVector& WorkspaceOrig
 	OutSourceActors.Reset();
 	OutShiftedSourceBounds = FBox(EForceInit::ForceInit);
 	OutStats = FProxySkinCollectionStats{};
+
+	const auto IsFoliageInstancedComponent = [](const UInstancedStaticMeshComponent* InstancedComponent, const AActor* OwnerActor) -> bool
+	{
+		if (InstancedComponent == nullptr)
+		{
+			return false;
+		}
+
+		const FString ComponentClassName = InstancedComponent->GetClass()->GetName();
+		if (ComponentClassName.Contains(TEXT("Foliage"), ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+
+		if (OwnerActor != nullptr)
+		{
+			const FString OwnerClassName = OwnerActor->GetClass()->GetName();
+			if (OwnerClassName.Contains(TEXT("InstancedFoliageActor"), ESearchCase::IgnoreCase))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	};
 
 	auto AddCandidateFromTransform = [&](AActor* OwnerActor, UStaticMeshComponent* MaterialSource, UStaticMesh* StaticMesh, const FTransform& SourceWorldTransform, int32 OptionalInstanceIndex)
 	{
@@ -360,6 +457,12 @@ bool AProxySkinVolume::CollectAndExpandSourceActors(const FVector& WorkspaceOrig
 
 		if (AStaticMeshActor* StaticMeshActor = Cast<AStaticMeshActor>(CandidateActor))
 		{
+			if (!bIncludeStaticMeshActors)
+			{
+				++OutStats.NumFilteredByType;
+				continue;
+			}
+
 			UStaticMeshComponent* StaticMeshComponent = StaticMeshActor->GetStaticMeshComponent();
 			if (StaticMeshComponent && StaticMeshComponent->GetStaticMesh())
 			{
@@ -399,7 +502,7 @@ bool AProxySkinVolume::CollectAndExpandSourceActors(const FVector& WorkspaceOrig
 			}
 		}
 
-		if (bIncludeInstancedStaticMeshes)
+		if (bIncludeInstancedStaticMeshes || bIncludeHierarchicalInstancedStaticMeshes || bIncludeFoliageInstancedStaticMeshes)
 		{
 			TInlineComponentArray<UInstancedStaticMeshComponent*> InstancedComponents(CandidateActor);
 			for (UInstancedStaticMeshComponent* InstancedComponent : InstancedComponents)
@@ -407,6 +510,21 @@ bool AProxySkinVolume::CollectAndExpandSourceActors(const FVector& WorkspaceOrig
 				if (!InstancedComponent || !InstancedComponent->GetStaticMesh())
 				{
 					++OutStats.NumInvalidComponents;
+					continue;
+				}
+
+				const bool bIsFoliageComponent = IsFoliageInstancedComponent(InstancedComponent, CandidateActor);
+				const bool bIsPlainISM = (InstancedComponent->GetClass() == UInstancedStaticMeshComponent::StaticClass());
+				const bool bIsHISMComponent = (!bIsPlainISM && !bIsFoliageComponent);
+
+				const bool bTypeEnabled =
+					(bIsPlainISM && bIncludeInstancedStaticMeshes) ||
+					(bIsHISMComponent && bIncludeHierarchicalInstancedStaticMeshes) ||
+					(bIsFoliageComponent && bIncludeFoliageInstancedStaticMeshes);
+
+				if (!bTypeEnabled)
+				{
+					++OutStats.NumFilteredByType;
 					continue;
 				}
 
@@ -513,6 +631,22 @@ bool AProxySkinVolume::IsWorldBoundsValidForCollection(const FBox& WorldBounds, 
 	{
 		bOutFilteredBySize = true;
 		return false;
+	}
+
+	const float MaxRatio = FMath::Max(0.0f, MaxBoundsToVolumeRatio);
+	if (MaxRatio > 0.0f)
+	{
+		const FVector VolumeSize = VolumeWorldAABB.GetSize();
+		const float VolumeMaxAxis = FMath::Max3(VolumeSize.X, VolumeSize.Y, VolumeSize.Z);
+		if (VolumeMaxAxis > KINDA_SMALL_NUMBER)
+		{
+			const float AllowedMaxAxis = VolumeMaxAxis * MaxRatio;
+			if (MaxAxis > AllowedMaxAxis)
+			{
+				bOutFilteredByBounds = true;
+				return false;
+			}
+		}
 	}
 
 	return true;
@@ -826,6 +960,9 @@ bool AProxySkinVolume::TrimDynamicMeshToVolume(UDynamicMesh* DynamicMesh, const 
 		return false;
 	}
 
+	const UE::Geometry::FDynamicMesh3 SourceMeshBeforeTrim = DynamicMesh->GetMeshRef();
+	const FBox MeshBoundsBefore = GetDynamicMeshBounds(DynamicMesh);
+
 	UDynamicMesh* ToolMesh = NewObject<UDynamicMesh>(GetTransientPackage(), NAME_None, RF_Transient);
 	if (ToolMesh == nullptr)
 	{
@@ -833,11 +970,20 @@ bool AProxySkinVolume::TrimDynamicMeshToVolume(UDynamicMesh* DynamicMesh, const 
 	}
 
 	// Use unscaled extent here because component transform already carries scale.
-	const FVector BoxExtent = VolumeBox->GetUnscaledBoxExtent();
+	const FVector BoxExtent = VolumeBox->GetUnscaledBoxExtent() + FVector(0.1f, 0.1f, 0.1f);
 	const FBox LocalBox(-BoxExtent, BoxExtent);
 
 	FTransform ShiftedBoxTransform = VolumeBox->GetComponentTransform();
 	ShiftedBoxTransform.AddToTranslation(-WorkspaceOrigin);
+
+	if (bVerboseLogging)
+	{
+		UE_LOG(LogProxySkinVolume, Log, TEXT("Trim setup: MeshBoundsCenter=%s MeshBoundsSize=%s BoxCenter=%s BoxExtent=%s"),
+			*MeshBoundsBefore.GetCenter().ToString(),
+			*MeshBoundsBefore.GetSize().ToString(),
+			*ShiftedBoxTransform.GetLocation().ToString(),
+			*BoxExtent.ToString());
+	}
 
 	FGeometryScriptPrimitiveOptions PrimitiveOptions;
 	PrimitiveOptions.PolygroupMode = EGeometryScriptPrimitivePolygroupMode::PerFace;
@@ -858,23 +1004,333 @@ bool AProxySkinVolume::TrimDynamicMeshToVolume(UDynamicMesh* DynamicMesh, const 
 		return false;
 	}
 
-	FGeometryScriptMeshBooleanOptions BooleanOptions;
-	BooleanOptions.bFillHoles = true;
-	BooleanOptions.bSimplifyOutput = true;
-	BooleanOptions.SimplifyPlanarTolerance = 0.01f;
-	BooleanOptions.bAllowEmptyResult = true;
-	BooleanOptions.OutputTransformSpace = EGeometryScriptBooleanOutputSpace::TargetTransformSpace;
+	auto TryTrimBoolean = [&](EGeometryScriptBooleanOperation Operation, const FGeometryScriptMeshBooleanOptions& Options, bool bRunSelfUnionFirst, const TCHAR* AttemptName) -> bool
+	{
+		UDynamicMesh* CandidateMesh = NewObject<UDynamicMesh>(GetTransientPackage(), NAME_None, RF_Transient);
+		if (CandidateMesh == nullptr)
+		{
+			return false;
+		}
 
-	UGeometryScriptLibrary_MeshBooleanFunctions::ApplyMeshBoolean(
+		CandidateMesh->SetMesh(SourceMeshBeforeTrim);
+		if (bRunSelfUnionFirst)
+		{
+			FGeometryScriptMeshSelfUnionOptions SelfUnionOptions;
+			SelfUnionOptions.bFillHoles = false;
+			SelfUnionOptions.bTrimFlaps = true;
+			SelfUnionOptions.bSimplifyOutput = false;
+			SelfUnionOptions.SimplifyPlanarTolerance = 0.0f;
+
+			UGeometryScriptLibrary_MeshBooleanFunctions::ApplyMeshSelfUnion(
+				CandidateMesh,
+				SelfUnionOptions,
+				nullptr);
+
+			if (CandidateMesh->IsEmpty())
+			{
+				if (bVerboseLogging)
+				{
+					UE_LOG(LogProxySkinVolume, Warning, TEXT("Trim attempt '%s' failed: self-union produced empty mesh."), AttemptName);
+				}
+				return false;
+			}
+		}
+
+		UGeometryScriptLibrary_MeshBooleanFunctions::ApplyMeshBoolean(
+			CandidateMesh,
+			FTransform::Identity,
+			ToolMesh,
+			FTransform::Identity,
+			Operation,
+			Options,
+			nullptr);
+
+		if (CandidateMesh->IsEmpty())
+		{
+			if (bVerboseLogging)
+			{
+				UE_LOG(LogProxySkinVolume, Warning, TEXT("Trim attempt '%s' produced empty mesh."), AttemptName);
+			}
+			return false;
+		}
+
+		DynamicMesh->SetMesh(CandidateMesh->GetMeshRef());
+		if (bVerboseLogging)
+		{
+			UE_LOG(LogProxySkinVolume, Log, TEXT("Trim attempt '%s' succeeded. Triangles=%d"), AttemptName, DynamicMesh->GetTriangleCount());
+		}
+		return true;
+	};
+
+	FGeometryScriptMeshBooleanOptions ConservativeOptions;
+	ConservativeOptions.bFillHoles = false;
+	ConservativeOptions.bSimplifyOutput = false;
+	ConservativeOptions.SimplifyPlanarTolerance = 0.0f;
+	ConservativeOptions.bAllowEmptyResult = true;
+	ConservativeOptions.OutputTransformSpace = EGeometryScriptBooleanOutputSpace::TargetTransformSpace;
+
+	if (TryTrimBoolean(EGeometryScriptBooleanOperation::TrimOutside, ConservativeOptions, false, TEXT("TrimOutside_Conservative")))
+	{
+		return true;
+	}
+
+	if (TryTrimBoolean(EGeometryScriptBooleanOperation::Intersection, ConservativeOptions, false, TEXT("Intersection_Conservative")))
+	{
+		return true;
+	}
+
+	if (TryTrimBoolean(EGeometryScriptBooleanOperation::TrimOutside, ConservativeOptions, true, TEXT("TrimOutside_AfterSelfUnion")))
+	{
+		return true;
+	}
+
+	FGeometryScriptMeshBooleanOptions AggressiveOptions = ConservativeOptions;
+	AggressiveOptions.bFillHoles = true;
+	AggressiveOptions.bSimplifyOutput = true;
+	AggressiveOptions.SimplifyPlanarTolerance = 0.01f;
+
+	if (TryTrimBoolean(EGeometryScriptBooleanOperation::Intersection, AggressiveOptions, true, TEXT("Intersection_Aggressive")))
+	{
+		return true;
+	}
+
+	auto TryTrimPlaneCut = [&](bool bFlipCutSideForAllPlanes, const TCHAR* AttemptName) -> bool
+	{
+		UDynamicMesh* CandidateMesh = NewObject<UDynamicMesh>(GetTransientPackage(), NAME_None, RF_Transient);
+		if (CandidateMesh == nullptr)
+		{
+			return false;
+		}
+
+		CandidateMesh->SetMesh(SourceMeshBeforeTrim);
+
+		const FVector Center = ShiftedBoxTransform.GetLocation();
+		const FVector AxisX = ShiftedBoxTransform.GetUnitAxis(EAxis::X);
+		const FVector AxisY = ShiftedBoxTransform.GetUnitAxis(EAxis::Y);
+		const FVector AxisZ = ShiftedBoxTransform.GetUnitAxis(EAxis::Z);
+		const FVector ScaledExtent = VolumeBox->GetScaledBoxExtent() + FVector(0.1f, 0.1f, 0.1f);
+
+		struct FPlaneDef
+		{
+			FVector Origin = FVector::ZeroVector;
+			FVector Normal = FVector::UpVector;
+		};
+
+		TArray<FPlaneDef, TInlineAllocator<6>> Planes;
+		Planes.Reserve(6);
+		Planes.Add({ Center + AxisX * ScaledExtent.X,  AxisX });
+		Planes.Add({ Center - AxisX * ScaledExtent.X, -AxisX });
+		Planes.Add({ Center + AxisY * ScaledExtent.Y,  AxisY });
+		Planes.Add({ Center - AxisY * ScaledExtent.Y, -AxisY });
+		Planes.Add({ Center + AxisZ * ScaledExtent.Z,  AxisZ });
+		Planes.Add({ Center - AxisZ * ScaledExtent.Z, -AxisZ });
+
+		FGeometryScriptMeshPlaneCutOptions CutOptions;
+		CutOptions.bFillHoles = false;
+		CutOptions.HoleFillMaterialID = INDEX_NONE;
+		CutOptions.bFillSpans = true;
+		CutOptions.bFlipCutSide = bFlipCutSideForAllPlanes;
+		CutOptions.UVWorldDimension = 1.0f;
+
+		for (const FPlaneDef& Plane : Planes)
+		{
+			const FQuat PlaneRotation = FRotationMatrix::MakeFromZ(Plane.Normal.GetSafeNormal()).ToQuat();
+			const FTransform CutFrame(PlaneRotation, Plane.Origin);
+			UGeometryScriptLibrary_MeshBooleanFunctions::ApplyMeshPlaneCut(
+				CandidateMesh,
+				CutFrame,
+				CutOptions,
+				nullptr);
+
+			if (CandidateMesh->IsEmpty())
+			{
+				if (bVerboseLogging)
+				{
+					UE_LOG(LogProxySkinVolume, Warning, TEXT("Trim attempt '%s' produced empty mesh while cutting with plane at %s."),
+						AttemptName, *Plane.Origin.ToString());
+				}
+				return false;
+			}
+		}
+
+		DynamicMesh->SetMesh(CandidateMesh->GetMeshRef());
+		if (bVerboseLogging)
+		{
+			UE_LOG(LogProxySkinVolume, Log, TEXT("Trim attempt '%s' succeeded. Triangles=%d"), AttemptName, DynamicMesh->GetTriangleCount());
+		}
+		return true;
+	};
+
+	if (TryTrimPlaneCut(false, TEXT("PlaneCut_KeepInside")))
+	{
+		return true;
+	}
+
+	if (TryTrimPlaneCut(true, TEXT("PlaneCut_KeepInside_Flipped")))
+	{
+		return true;
+	}
+
+	auto TryCoarseTriangleBoxTrim = [&]() -> bool
+	{
+		UDynamicMesh* CandidateMesh = NewObject<UDynamicMesh>(GetTransientPackage(), NAME_None, RF_Transient);
+		if (CandidateMesh == nullptr)
+		{
+			return false;
+		}
+
+		CandidateMesh->SetMesh(SourceMeshBeforeTrim);
+
+		const FTransform InvShiftedBoxTransform = ShiftedBoxTransform.Inverse();
+		const FVector LocalMin = -BoxExtent;
+		const FVector LocalMax = BoxExtent;
+
+		CandidateMesh->EditMesh(
+			[&](UE::Geometry::FDynamicMesh3& EditMesh)
+			{
+				TArray<int32> TrianglesToRemove;
+				TrianglesToRemove.Reserve(EditMesh.TriangleCount());
+
+				for (int32 TriangleID : EditMesh.TriangleIndicesItr())
+				{
+					const auto Triangle = EditMesh.GetTriangle(TriangleID);
+					const FVector3d A = EditMesh.GetVertex(Triangle.A);
+					const FVector3d B = EditMesh.GetVertex(Triangle.B);
+					const FVector3d C = EditMesh.GetVertex(Triangle.C);
+
+					const FVector AL = InvShiftedBoxTransform.TransformPosition((FVector)A);
+					const FVector BL = InvShiftedBoxTransform.TransformPosition((FVector)B);
+					const FVector CL = InvShiftedBoxTransform.TransformPosition((FVector)C);
+
+					FBox TriangleBounds(EForceInit::ForceInit);
+					TriangleBounds += AL;
+					TriangleBounds += BL;
+					TriangleBounds += CL;
+
+					const bool bIntersectsVolume =
+						!(TriangleBounds.Max.X < LocalMin.X || TriangleBounds.Min.X > LocalMax.X
+						|| TriangleBounds.Max.Y < LocalMin.Y || TriangleBounds.Min.Y > LocalMax.Y
+						|| TriangleBounds.Max.Z < LocalMin.Z || TriangleBounds.Min.Z > LocalMax.Z);
+
+					if (!bIntersectsVolume)
+					{
+						TrianglesToRemove.Add(TriangleID);
+					}
+				}
+
+				for (int32 TriangleID : TrianglesToRemove)
+				{
+					EditMesh.RemoveTriangle(TriangleID, false, false);
+				}
+
+				EditMesh.CompactInPlace();
+			},
+			EDynamicMeshChangeType::GeneralEdit,
+			EDynamicMeshAttributeChangeFlags::Unknown,
+			false);
+
+		if (CandidateMesh->IsEmpty())
+		{
+			return false;
+		}
+
+		DynamicMesh->SetMesh(CandidateMesh->GetMeshRef());
+		if (bVerboseLogging)
+		{
+			UE_LOG(LogProxySkinVolume, Warning, TEXT("Trim fallback 'CoarseTriangleBoxTrim' used. Triangles=%d"), DynamicMesh->GetTriangleCount());
+		}
+		return true;
+	};
+
+	if (TryCoarseTriangleBoxTrim())
+	{
+		return true;
+	}
+
+	return false;
+}
+
+bool AProxySkinVolume::ApplyOptionalVoxelRemeshDecimate(UDynamicMesh* DynamicMesh, const FVector& WorkspaceOrigin) const
+{
+	if (!bUseVoxelRemeshDecimate)
+	{
+		return true;
+	}
+
+	if (DynamicMesh == nullptr || DynamicMesh->IsEmpty())
+	{
+		return false;
+	}
+
+	const int32 TrianglesBefore = DynamicMesh->GetTriangleCount();
+
+	FGeometryScriptSolidifyOptions SolidifyOptions;
+	SolidifyOptions.GridParameters.SizeMethod = EGeometryScriptGridSizingMethod::GridResolution;
+	SolidifyOptions.GridParameters.GridResolution = FMath::Clamp(VoxelGridResolution, 16, 512);
+	SolidifyOptions.WindingThreshold = 0.5f;
+	SolidifyOptions.bSolidAtBoundaries = true;
+	SolidifyOptions.ExtendBounds = FMath::Max(0.0f, VoxelBoundsPaddingCm);
+	SolidifyOptions.SurfaceSearchSteps = 3;
+	SolidifyOptions.bThickenShells = false;
+	SolidifyOptions.ShellThickness = 1.0;
+
+	if (bVoxelUseVolumeBounds && VolumeBox != nullptr)
+	{
+		FTransform ShiftedBoxTransform = VolumeBox->GetComponentTransform();
+		ShiftedBoxTransform.AddToTranslation(-WorkspaceOrigin);
+
+		const FVector Ext = VolumeBox->GetUnscaledBoxExtent() + FVector(FMath::Max(0.0f, VoxelBoundsPaddingCm));
+		FBox CustomBounds(EForceInit::ForceInit);
+		for (int32 SX = -1; SX <= 1; SX += 2)
+		{
+			for (int32 SY = -1; SY <= 1; SY += 2)
+			{
+				for (int32 SZ = -1; SZ <= 1; SZ += 2)
+				{
+					const FVector CornerLocal(static_cast<float>(SX) * Ext.X, static_cast<float>(SY) * Ext.Y, static_cast<float>(SZ) * Ext.Z);
+					CustomBounds += ShiftedBoxTransform.TransformPosition(CornerLocal);
+				}
+			}
+		}
+		SolidifyOptions.CustomBounds = CustomBounds;
+	}
+
+	UGeometryScriptLibrary_MeshVoxelFunctions::ApplyMeshSolidify(
 		DynamicMesh,
-		FTransform::Identity,
-		ToolMesh,
-		FTransform::Identity,
-		EGeometryScriptBooleanOperation::Intersection,
-		BooleanOptions,
+		SolidifyOptions,
 		nullptr);
 
-	return !DynamicMesh->IsEmpty();
+	if (DynamicMesh->IsEmpty())
+	{
+		UE_LOG(LogProxySkinVolume, Warning, TEXT("Voxel remesh produced empty mesh."));
+		return false;
+	}
+
+	const int32 TrianglesAfterVoxel = DynamicMesh->GetTriangleCount();
+	const int32 TargetTriangles = FMath::Clamp(VoxelDecimateTargetTriangles, 64, FMath::Max(64, TrianglesAfterVoxel - 1));
+	if (TrianglesAfterVoxel > TargetTriangles)
+	{
+		UGeometryScriptLibrary_MeshSimplifyFunctions::ApplyEditorSimplifyToTriangleCount(
+			DynamicMesh,
+			TargetTriangles,
+			nullptr);
+	}
+
+	if (DynamicMesh->IsEmpty())
+	{
+		UE_LOG(LogProxySkinVolume, Warning, TEXT("Voxel decimate produced empty mesh."));
+		return false;
+	}
+
+	if (bVerboseLogging)
+	{
+		UE_LOG(LogProxySkinVolume, Log, TEXT("Voxel remesh+decimate: triangles %d -> %d -> %d"),
+			TrianglesBefore,
+			TrianglesAfterVoxel,
+			DynamicMesh->GetTriangleCount());
+	}
+
+	return true;
 }
 
 bool AProxySkinVolume::ApplyPivotSphereToDynamicMesh(UDynamicMesh* DynamicMesh, const FVector& WorkspaceOrigin) const
@@ -1084,6 +1540,358 @@ void AProxySkinVolume::CleanupTemporaryActors(bool bForceDeleteAll)
 	if ((DeletedSourceActors > 0 || DeletedProxyActors > 0) && bVerboseLogging)
 	{
 		UE_LOG(LogProxySkinVolume, Log, TEXT("Cleanup temp actors: deleted source=%d, deleted proxy=%d"), DeletedSourceActors, DeletedProxyActors);
+	}
+}
+
+bool AProxySkinVolume::ShouldDrawEditorPreview() const
+{
+#if WITH_EDITOR
+	if (!bPreviewVolumeWireframe && !bPreviewMeshEdgesInVolume)
+	{
+		return false;
+	}
+
+	const UWorld* World = GetWorld();
+	if (World == nullptr || World->IsGameWorld())
+	{
+		return false;
+	}
+
+	if (bPreviewOnlyWhenSelected && !IsSelected())
+	{
+		return false;
+	}
+
+	return true;
+#else
+	return false;
+#endif
+}
+
+void AProxySkinVolume::DrawEditorPreview() const
+{
+	if (bPreviewVolumeWireframe)
+	{
+		DrawVolumeAndPivotPreview();
+	}
+
+	if (bPreviewMeshEdgesInVolume)
+	{
+		DrawMeshEdgesPreview();
+	}
+}
+
+void AProxySkinVolume::DrawVolumeAndPivotPreview() const
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || VolumeBox == nullptr || PivotSphere == nullptr)
+	{
+		return;
+	}
+
+	const float Thickness = FMath::Max(0.1f, PreviewWireThickness);
+	DrawDebugBox(
+		World,
+		VolumeBox->GetComponentLocation(),
+		VolumeBox->GetScaledBoxExtent(),
+		VolumeBox->GetComponentQuat(),
+		VolumeWireColor,
+		false,
+		0.0f,
+		0,
+		Thickness);
+
+	const FVector PivotLocation = PivotSphere->GetComponentLocation();
+	const float PivotRadius = FMath::Max(6.0f, PivotSphere->GetScaledSphereRadius());
+	DrawDebugSphere(World, PivotLocation, PivotRadius, 20, PivotWireColor, false, 0.0f, 0, Thickness);
+
+	const float AxisLen = PivotRadius * 1.5f;
+	DrawDebugLine(World, PivotLocation - FVector(AxisLen, 0.0f, 0.0f), PivotLocation + FVector(AxisLen, 0.0f, 0.0f), PivotWireColor, false, 0.0f, 0, Thickness);
+	DrawDebugLine(World, PivotLocation - FVector(0.0f, AxisLen, 0.0f), PivotLocation + FVector(0.0f, AxisLen, 0.0f), PivotWireColor, false, 0.0f, 0, Thickness);
+	DrawDebugLine(World, PivotLocation - FVector(0.0f, 0.0f, AxisLen), PivotLocation + FVector(0.0f, 0.0f, AxisLen), PivotWireColor, false, 0.0f, 0, Thickness);
+}
+
+bool AProxySkinVolume::ClipLineSegmentToAABB(FVector& InOutStart, FVector& InOutEnd, const FVector& MinBounds, const FVector& MaxBounds)
+{
+	const FVector Delta = InOutEnd - InOutStart;
+	float TEnter = 0.0f;
+	float TExit = 1.0f;
+
+	auto ClipAxis = [&TEnter, &TExit](float P, float Q) -> bool
+	{
+		if (FMath::IsNearlyZero(P))
+		{
+			return Q >= 0.0f;
+		}
+
+		const float R = Q / P;
+		if (P < 0.0f)
+		{
+			if (R > TExit)
+			{
+				return false;
+			}
+			if (R > TEnter)
+			{
+				TEnter = R;
+			}
+		}
+		else
+		{
+			if (R < TEnter)
+			{
+				return false;
+			}
+			if (R < TExit)
+			{
+				TExit = R;
+			}
+		}
+
+		return true;
+	};
+
+	if (!ClipAxis(-Delta.X, InOutStart.X - MinBounds.X) || !ClipAxis(Delta.X, MaxBounds.X - InOutStart.X)
+		|| !ClipAxis(-Delta.Y, InOutStart.Y - MinBounds.Y) || !ClipAxis(Delta.Y, MaxBounds.Y - InOutStart.Y)
+		|| !ClipAxis(-Delta.Z, InOutStart.Z - MinBounds.Z) || !ClipAxis(Delta.Z, MaxBounds.Z - InOutStart.Z))
+	{
+		return false;
+	}
+
+	const FVector OriginalStart = InOutStart;
+	InOutStart = OriginalStart + (Delta * TEnter);
+	InOutEnd = OriginalStart + (Delta * TExit);
+	return true;
+}
+
+void AProxySkinVolume::DrawStaticMeshEdgesClippedToVolume(
+	UStaticMesh* StaticMesh,
+	const FTransform& MeshToWorld,
+	const FTransform& VolumeWorldTransform,
+	const FVector& VolumeLocalExtents,
+	int32& InOutDrawCount) const
+{
+	if (StaticMesh == nullptr || MaxPreviewEdgeLines <= 0 || InOutDrawCount >= MaxPreviewEdgeLines)
+	{
+		return;
+	}
+
+	const FStaticMeshRenderData* RenderData = StaticMesh->GetRenderData();
+	if (RenderData == nullptr || RenderData->LODResources.Num() <= 0)
+	{
+		return;
+	}
+
+	const FStaticMeshLODResources& LOD = RenderData->LODResources[0];
+	const FIndexArrayView Indices = LOD.IndexBuffer.GetArrayView();
+	const FPositionVertexBuffer& Positions = LOD.VertexBuffers.PositionVertexBuffer;
+	if (Indices.Num() < 3 || Positions.GetNumVertices() <= 0)
+	{
+		return;
+	}
+
+	TSet<uint64> UniqueEdges;
+	UniqueEdges.Reserve(Indices.Num());
+
+	auto AddEdge = [&UniqueEdges](uint32 A, uint32 B)
+	{
+		const uint32 MinIndex = FMath::Min(A, B);
+		const uint32 MaxIndex = FMath::Max(A, B);
+		const uint64 Key = (static_cast<uint64>(MinIndex) << 32) | static_cast<uint64>(MaxIndex);
+		UniqueEdges.Add(Key);
+	};
+
+	for (int32 TriIndex = 0; TriIndex + 2 < Indices.Num(); TriIndex += 3)
+	{
+		AddEdge(Indices[TriIndex], Indices[TriIndex + 1]);
+		AddEdge(Indices[TriIndex + 1], Indices[TriIndex + 2]);
+		AddEdge(Indices[TriIndex + 2], Indices[TriIndex]);
+	}
+
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	const FVector LocalMin = -VolumeLocalExtents;
+	const FVector LocalMax = VolumeLocalExtents;
+	const float EdgeThickness = FMath::Max(0.1f, PreviewWireThickness * 0.6f);
+
+	for (const uint64 EdgeKey : UniqueEdges)
+	{
+		if (InOutDrawCount >= MaxPreviewEdgeLines)
+		{
+			return;
+		}
+
+		const uint32 IndexA = static_cast<uint32>(EdgeKey >> 32);
+		const uint32 IndexB = static_cast<uint32>(EdgeKey & 0xFFFFFFFF);
+		if (IndexA >= static_cast<uint32>(Positions.GetNumVertices()) || IndexB >= static_cast<uint32>(Positions.GetNumVertices()))
+		{
+			continue;
+		}
+
+		const FVector PointAWorld = MeshToWorld.TransformPosition(FVector(Positions.VertexPosition(IndexA)));
+		const FVector PointBWorld = MeshToWorld.TransformPosition(FVector(Positions.VertexPosition(IndexB)));
+
+		FVector PointALocal = VolumeWorldTransform.InverseTransformPosition(PointAWorld);
+		FVector PointBLocal = VolumeWorldTransform.InverseTransformPosition(PointBWorld);
+
+		if (!ClipLineSegmentToAABB(PointALocal, PointBLocal, LocalMin, LocalMax))
+		{
+			continue;
+		}
+
+		const FVector ClippedStartWorld = VolumeWorldTransform.TransformPosition(PointALocal);
+		const FVector ClippedEndWorld = VolumeWorldTransform.TransformPosition(PointBLocal);
+		DrawDebugLine(World, ClippedStartWorld, ClippedEndWorld, EdgeWireColor, false, 0.0f, 0, EdgeThickness);
+		++InOutDrawCount;
+	}
+}
+
+void AProxySkinVolume::DrawMeshEdgesPreview() const
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || VolumeBox == nullptr || MaxPreviewEdgeLines <= 0)
+	{
+		return;
+	}
+
+	const FBox VolumeWorldAABB = GetVolumeWorldAABB();
+	if (!VolumeWorldAABB.IsValid)
+	{
+		return;
+	}
+
+	const FTransform VolumeWorldTransform = VolumeBox->GetComponentTransform();
+	const FVector VolumeLocalExtents = VolumeBox->GetUnscaledBoxExtent();
+	int32 DrawnEdges = 0;
+
+	const auto IsFoliageInstancedComponent = [](const UInstancedStaticMeshComponent* InstancedComponent, const AActor* OwnerActor) -> bool
+	{
+		if (InstancedComponent == nullptr)
+		{
+			return false;
+		}
+
+		if (InstancedComponent->GetClass()->GetName().Contains(TEXT("Foliage"), ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+
+		return OwnerActor != nullptr
+			&& OwnerActor->GetClass()->GetName().Contains(TEXT("InstancedFoliageActor"), ESearchCase::IgnoreCase);
+	};
+
+	for (TActorIterator<AActor> It(World); It && DrawnEdges < MaxPreviewEdgeLines; ++It)
+	{
+		AActor* CandidateActor = *It;
+		if (!IsValid(CandidateActor) || CandidateActor == this || CandidateActor->Tags.Contains(ProxySkinTempActorTag))
+		{
+			continue;
+		}
+
+		if (AStaticMeshActor* StaticMeshActor = Cast<AStaticMeshActor>(CandidateActor))
+		{
+			if (!bIncludeStaticMeshActors)
+			{
+				continue;
+			}
+
+			if (UStaticMeshComponent* StaticMeshComponent = StaticMeshActor->GetStaticMeshComponent())
+			{
+				if (UStaticMesh* StaticMesh = StaticMeshComponent->GetStaticMesh())
+				{
+					const FBox MeshWorldBounds = StaticMesh->GetBoundingBox().TransformBy(StaticMeshComponent->GetComponentTransform());
+					if (VolumeWorldAABB.Intersect(MeshWorldBounds))
+					{
+						DrawStaticMeshEdgesClippedToVolume(StaticMesh, StaticMeshComponent->GetComponentTransform(), VolumeWorldTransform, VolumeLocalExtents, DrawnEdges);
+					}
+				}
+			}
+			continue;
+		}
+
+		if (bIncludeBlueprintStaticMeshComponents)
+		{
+			TInlineComponentArray<UStaticMeshComponent*> StaticMeshComponents(CandidateActor);
+			for (UStaticMeshComponent* StaticMeshComponent : StaticMeshComponents)
+			{
+				if (DrawnEdges >= MaxPreviewEdgeLines)
+				{
+					return;
+				}
+
+				if (!StaticMeshComponent || !StaticMeshComponent->GetStaticMesh())
+				{
+					continue;
+				}
+
+				if (Cast<UInstancedStaticMeshComponent>(StaticMeshComponent) != nullptr)
+				{
+					continue;
+				}
+
+				UStaticMesh* StaticMesh = StaticMeshComponent->GetStaticMesh();
+				const FTransform MeshToWorld = StaticMeshComponent->GetComponentTransform();
+				const FBox MeshWorldBounds = StaticMesh->GetBoundingBox().TransformBy(MeshToWorld);
+				if (!VolumeWorldAABB.Intersect(MeshWorldBounds))
+				{
+					continue;
+				}
+
+				DrawStaticMeshEdgesClippedToVolume(StaticMesh, MeshToWorld, VolumeWorldTransform, VolumeLocalExtents, DrawnEdges);
+			}
+		}
+
+		if (bIncludeInstancedStaticMeshes || bIncludeHierarchicalInstancedStaticMeshes || bIncludeFoliageInstancedStaticMeshes)
+		{
+			TInlineComponentArray<UInstancedStaticMeshComponent*> InstancedComponents(CandidateActor);
+			for (UInstancedStaticMeshComponent* InstancedComponent : InstancedComponents)
+			{
+				if (DrawnEdges >= MaxPreviewEdgeLines)
+				{
+					return;
+				}
+
+				if (!InstancedComponent || !InstancedComponent->GetStaticMesh())
+				{
+					continue;
+				}
+
+				const bool bIsFoliageComponent = IsFoliageInstancedComponent(InstancedComponent, CandidateActor);
+				const bool bIsPlainISM = (InstancedComponent->GetClass() == UInstancedStaticMeshComponent::StaticClass());
+				const bool bIsHISMComponent = (!bIsPlainISM && !bIsFoliageComponent);
+				const bool bTypeEnabled =
+					(bIsPlainISM && bIncludeInstancedStaticMeshes) ||
+					(bIsHISMComponent && bIncludeHierarchicalInstancedStaticMeshes) ||
+					(bIsFoliageComponent && bIncludeFoliageInstancedStaticMeshes);
+				if (!bTypeEnabled)
+				{
+					continue;
+				}
+
+				UStaticMesh* StaticMesh = InstancedComponent->GetStaticMesh();
+				const int32 InstanceCount = InstancedComponent->GetInstanceCount();
+				for (int32 InstanceIndex = 0; InstanceIndex < InstanceCount && DrawnEdges < MaxPreviewEdgeLines; ++InstanceIndex)
+				{
+					FTransform InstanceWorldTransform;
+					if (!InstancedComponent->GetInstanceTransform(InstanceIndex, InstanceWorldTransform, true))
+					{
+						continue;
+					}
+
+					const FBox MeshWorldBounds = StaticMesh->GetBoundingBox().TransformBy(InstanceWorldTransform);
+					if (!VolumeWorldAABB.Intersect(MeshWorldBounds))
+					{
+						continue;
+					}
+
+					DrawStaticMeshEdgesClippedToVolume(StaticMesh, InstanceWorldTransform, VolumeWorldTransform, VolumeLocalExtents, DrawnEdges);
+				}
+			}
+		}
 	}
 }
 
